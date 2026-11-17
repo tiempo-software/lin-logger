@@ -1,8 +1,9 @@
 """
 LIN bus logger for Raspberry Pi Pico (MicroPython)
 
-Listens passively to a LIN bus through a transceiver (TJA1021, MCP2003B, ...)
-and prints one line per frame over USB serial:
+Listens passively to a LIN bus through a transceiver (TJA1021, MCP2003B, ...),
+prints one line per frame over USB serial and, if a microSD card is attached,
+writes the same frames to a CSV file (lin_0001.csv, lin_0002.csv, ...).
 
     time_ms     id  pid  len  data                      chk  cs   status
 
@@ -10,23 +11,35 @@ How it works
   * A PIO state machine acts as the UART receiver. Besides normal bytes it
     detects the LIN *break* (>= 13 dominant bits) and pushes a marker, so
     frame boundaries are exact even if 00 55 shows up inside the data.
+  * A hard interrupt moves every received byte into a 2 s ring buffer with a
+    microsecond timestamp, so slow SD writes, USB printing or the OLED can
+    block the main loop without losing data or skewing timestamps.
   * LIN doesn't put the data length on the wire, so everything between one
     break and the next is one frame: sync, PID, data..., checksum.
   * Checksum is checked as enhanced (LIN 2.x, includes PID) and classic
     (LIN 1.x / diagnostic IDs 0x3C-0x3D) and the matching type is reported.
 
-SIMULATE = True drives fake LIN traffic out of GP4 (second PIO state machine) so the
-whole thing runs in Wokwi or on a bench: wire GP4 -> GP5.
+Buttons
+  * GP15 to GND: clear counters and timestamps and start a new log file.
+  * RUN (pin 30) to GND: hardware reset, no code needed.
+
+SIMULATE = True drives fake LIN traffic out of GP4 (second PIO state machine)
+so the whole thing runs in Wokwi or on a bench: wire GP4 -> GP5.
 """
 
 LIN_BAUD = 19200        # common: 19200, 10417, 9600
 RX_PIN = 5              # transceiver RXD -> GP5
 SIMULATE = True         # fake LIN master on GP4 (wire GP4 -> GP5)
 SIM_TX_PIN = 4
-OLED_SDA, OLED_SCL = 8, 9   # optional SSD1306 128x64 status display
+OLED_SDA, OLED_SCL = 8, 9           # optional SSD1306 128x64 status display
+BTN_RESET_PIN = 15                  # button to GND: new log + clear counters
+SD_SCK, SD_MOSI, SD_MISO, SD_CS = 10, 11, 12, 13   # optional microSD (SPI1)
+SD_FLUSH_MS = 2000      # write buffered lines to the card this often
+RING = 4096             # capture buffer in bytes-on-the-wire (power of 2)
 
 BIT_US = 1_000_000 // LIN_BAUD
 IDLE_US = 200 * BIT_US  # ~ max LIN frame time; ends the last frame of a burst
+BREAK = 0x1FF           # marker the PIO pushes for a break
 
 
 # ---------------------------------------------------------------- LIN helpers
@@ -87,26 +100,34 @@ def h2(v):
     return "--" if v is None else "%02X" % v
 
 
-def format_line(t_ms, fr):
+def format_lines(t_us, fr):
+    """-> (console line, CSV line, status). Integer math only: MicroPython
+    floats are single precision and would lose resolution on long logs."""
     fid, pid, data, chk, cs, status = decode(fr)
-    hexdata = " ".join("%02X" % x for x in data) if data else "-"
-    return "%10.1f  %s   %s  %3d  %-24s  %s   %-3s  %s" % (
-        t_ms, h2(fid), h2(pid), len(data), hexdata, h2(chk), cs, status), status
+    hexdata = " ".join("%02X" % x for x in data)
+    t = "%d.%d" % (t_us // 1000, (t_us // 100) % 10)
+    con = "%10s  %s   %s  %3d  %-24s  %s   %-3s  %s" % (
+        t, h2(fid), h2(pid), len(data), hexdata or "-", h2(chk), cs, status)
+    csv = "%s,%s,%s,%d,%s,%s,%s,%s\n" % (
+        t, h2(fid), h2(pid), len(data), hexdata, h2(chk), cs, status)
+    return con, csv, status
 
 
 HEADER = "   time_ms  id  pid  len  data                      chk  cs   status"
+CSV_HEADER = "time_ms,id,pid,len,data,chk,cs,status\n"
 
 
 # ------------------------------------------------------------------- hardware
 def main():
     import time
+    import array
     import rp2
     import framebuf
-    from machine import Pin, I2C, mem32
+    from machine import Pin, I2C, SPI, mem32
 
-    # PIO UART receiver with break detection. Data bytes arrive as
-    # (byte << 24); a break (all-zero byte + low stop bit) arrives as
-    # 0xFFFFFFFF. Other framing errors are dropped.
+    # PIO UART receiver with break detection. Pushes each data byte as
+    # 0x00-0xFF and a break (all-zero byte + low stop bit) as 0x1FF, then
+    # raises an IRQ. Other framing errors are dropped.
     @rp2.asm_pio(in_shiftdir=rp2.PIO.SHIFT_RIGHT, fifo_join=rp2.PIO.JOIN_RX)
     def lin_rx():
         label("start")
@@ -123,17 +144,44 @@ def main():
         jmp("start")
         label("brk")
         mov(isr, invert(null))
+        in_(null, 23)           # 0xFFFFFFFF >> 23 = 0x1FF
         push()
+        irq(rel(0))
         wait(1, pin, 0)
         jmp("start")
         label("good_stop")
+        in_(null, 24)           # move the byte down to bits 7..0
         push()
+        irq(rel(0))
 
     rx_pin = Pin(RX_PIN, Pin.IN, Pin.PULL_UP)
     sm = rp2.StateMachine(0, lin_rx, freq=8 * LIN_BAUD,
                           in_base=rx_pin, jmp_pin=rx_pin)
-    sm.active(1)
     PIO0_FDEBUG = 0x50200000 + 0x008   # RXSTALL bit 0 = SM0 FIFO overflowed
+
+    # Ring buffer filled by a hard IRQ: value + arrival time for every byte.
+    MASK = RING - 1
+    ring = array.array("H", bytes(2 * RING))
+    tring = array.array("I", bytes(4 * RING))
+    st = array.array("I", [0, 0, 0])   # head, tail, dropped
+
+    # Everything is passed as default args: a closure over this many names
+    # would allocate on each call, which a hard IRQ isn't allowed to do.
+    def on_rx(_, sm=sm, st=st, ring=ring, tring=tring, mask=MASK,
+              ticks_us=time.ticks_us):
+        while sm.rx_fifo():
+            w = sm.get()
+            h = st[0]
+            n = (h + 1) & mask
+            if n == st[1]:
+                st[2] += 1
+            else:
+                ring[h] = w
+                tring[h] = ticks_us()
+                st[0] = n
+
+    sm.irq(on_rx, hard=True)
+    sm.active(1)
 
     # ---- optional fake LIN master: a second PIO state machine that clocks
     # out raw line bits (break, delimiter, start/data/stop) prepared in Python.
@@ -193,8 +241,7 @@ def main():
 
     sim = SimMaster() if SIMULATE else None
 
-    # ---- optional SSD1306, refreshed in small chunks so the PIO FIFO
-    # (8 words ~ 4 ms at 19200) never overflows while the display updates.
+    # ---- optional SSD1306, refreshed in small chunks to keep the loop snappy
     class Oled(framebuf.FrameBuffer):
         def __init__(self, i2c, addr):
             self.i2c, self.addr = i2c, addr
@@ -233,26 +280,101 @@ def main():
     except Exception as e:
         print("OLED disabled:", e)
 
+    # ---- optional microSD logging (needs sdcard.py on the Pico)
+    class SdLog:
+        def __init__(self):
+            self.ok = False
+            self.f = None
+            self.name = ""
+            self.lines = []
+            self.next_flush = time.ticks_ms()
+            try:
+                import os
+                import sdcard
+                self.os = os
+                spi = SPI(1, baudrate=1_000_000, sck=Pin(SD_SCK),
+                          mosi=Pin(SD_MOSI), miso=Pin(SD_MISO))
+                card = sdcard.SDCard(spi, Pin(SD_CS, Pin.OUT), baudrate=4_000_000)
+                os.mount(card, "/sd")
+                self.ok = True
+                self.new_file()
+            except Exception as e:
+                self.ok = False
+                self.name = "off"
+                print("SD logging disabled:", e)
+
+        def new_file(self):
+            if not self.ok:
+                return
+            self.flush()
+            if self.f:
+                self.f.close()
+            nums = [int(n[4:8]) for n in self.os.listdir("/sd")
+                    if n.startswith("lin_") and n.endswith(".csv") and n[4:8].isdigit()]
+            self.name = "lin_%04d.csv" % (max(nums) + 1 if nums else 1)
+            self.f = open("/sd/" + self.name, "w")
+            self.f.write(CSV_HEADER)
+            self.f.flush()
+
+        def add(self, line):
+            if self.ok:
+                self.lines.append(line)
+
+        def flush(self):
+            if not (self.ok and self.f and self.lines):
+                return
+            try:
+                self.f.write("".join(self.lines))
+                self.f.flush()
+                self.lines = []
+            except Exception as e:
+                self.ok = False
+                self.name = "ERROR"
+                print("!! SD write failed, logging stopped:", e)
+
+        def step(self, ms):
+            if self.lines and (len(self.lines) >= 100 or
+                               time.ticks_diff(ms, self.next_flush) >= 0):
+                self.flush()
+                self.next_flush = time.ticks_add(ms, SD_FLUSH_MS)
+
+    sd = SdLog()
+    btn = Pin(BTN_RESET_PIN, Pin.IN, Pin.PULL_UP)
+
     # ---- main loop
     time.sleep(0.1)
     print("LIN logger @ %d baud, RX on GP%d%s" % (
         LIN_BAUD, RX_PIN, ", SIMULATE (GP4 -> GP5)" if SIMULATE else ""))
+    if sd.ok:
+        print("logging to /sd/" + sd.name)
     print(HEADER)
 
-    t0 = time.ticks_us()
+    # ticks_us() wraps every ~18 min, so keep an extended microsecond clock
+    clk = [time.ticks_us(), 0]          # last ticks value, extended us
+
+    def ext(t):
+        clk[1] += time.ticks_diff(t, clk[0])
+        clk[0] = t
+        return clk[1]
+
+    t0 = ext(time.ticks_us())
     frame = None
     t_frame = 0
-    last_rx = t0
-    frames = errors = overruns = stray = 0
+    last_rx = time.ticks_us()
+    frames = errors = overruns = 0
+    dropped_seen = lost_fifo = 0
+    warn_t = time.ticks_ms()
     last_id = None
     last_status = ""
     fps_count, fps, fps_t = 0, 0, time.ticks_ms()
     next_draw = time.ticks_ms()
+    btn_prev, btn_t = 1, 0
 
     def emit(t, fr):
         nonlocal frames, errors, last_id, last_status, fps_count
-        line, status = format_line(time.ticks_diff(t, t0) / 1000, fr)
-        print(line)
+        con, csv, status = format_lines(ext(t) - t0, fr)
+        print(con)
+        sd.add(csv)
         frames += 1
         fps_count += 1
         if status not in ("OK", "NO_RESP"):
@@ -262,51 +384,77 @@ def main():
         last_status = status
 
     while True:
-        now = time.ticks_us()
-        while sm.rx_fifo():
-            w = sm.get()
-            now = time.ticks_us()
-            last_rx = now
-            if w & 0xFFFFFF:                 # break marker
+        ext(time.ticks_us())                 # keep the extended clock fresh
+        # 1) frames out of the ring buffer
+        tl = st[1]
+        while tl != st[0]:
+            w = ring[tl]
+            t = tring[tl]
+            tl = (tl + 1) & MASK
+            st[1] = tl
+            last_rx = t
+            if w == BREAK:
                 if frame is not None:
                     emit(t_frame, frame)
                 frame = bytearray()
-                t_frame = now
+                t_frame = t
             elif frame is not None:
-                frame.append(w >> 24)
+                frame.append(w)
                 if len(frame) > 12:          # runaway: no break seen
                     emit(t_frame, frame)
                     frame = None
-            else:
-                stray += 1
 
-        if frame is not None and time.ticks_diff(now, last_rx) > IDLE_US:
+        if frame is not None and time.ticks_diff(time.ticks_us(), last_rx) > IDLE_US:
             emit(t_frame, frame)
             frame = None
 
+        ms = time.ticks_ms()
+
+        # 2) data-loss checks (reported at most once per second)
         if mem32[PIO0_FDEBUG] & 1:
             mem32[PIO0_FDEBUG] = 1           # write-1-to-clear
+            lost_fifo += 1
+        if (lost_fifo or st[2] != dropped_seen) and time.ticks_diff(ms, warn_t) >= 0:
+            warn_t = time.ticks_add(ms, 1000)
             overruns += 1
-            print("!! RX FIFO overrun (data lost)")
+            print("!! data lost: PIO FIFO overflowed %d times, ring buffer dropped %d bytes"
+                  % (lost_fifo, st[2] - dropped_seen))
+            lost_fifo, dropped_seen = 0, st[2]
 
+        # 3) reset button: clear counters, restart time, new log file
+        b = btn.value()
+        if b != btn_prev and time.ticks_diff(ms, btn_t) > 50:
+            btn_prev, btn_t = b, ms
+            if b == 0:
+                if frame is not None:
+                    emit(t_frame, frame)
+                    frame = None
+                sd.new_file()
+                frames = errors = overruns = 0
+                last_id, last_status = None, ""
+                t0 = ext(time.ticks_us())
+                print("# reset%s" % (" - logging to /sd/" + sd.name if sd.ok else ""))
+                print(HEADER)
+
+        # 4) housekeeping
         if sim:
             sim.step()
+        sd.step(ms)
 
-        ms = time.ticks_ms()
         if time.ticks_diff(ms, fps_t) >= 1000:
             fps, fps_count, fps_t = fps_count, 0, ms
 
-        if oled and not sm.rx_fifo():
+        if oled:
             if oled.chunk < 0 and time.ticks_diff(ms, next_draw) >= 0:
                 next_draw = time.ticks_add(ms, 500)
                 oled.fill(0)
                 oled.text("LIN %d bd" % LIN_BAUD, 0, 0)
                 oled.hline(0, 10, 128, 1)
-                oled.text("frames %d" % frames, 0, 14)
-                oled.text("fps    %d" % fps, 0, 24)
-                oled.text("errors %d" % errors, 0, 34)
-                oled.text("last %s %s" % (h2(last_id), last_status[:7]), 0, 44)
-                oled.text("ovr %d  stray %d" % (overruns, stray), 0, 54)
+                oled.text("frm %d %d/s" % (frames, fps), 0, 14)
+                oled.text("err %d ovr %d" % (errors, overruns), 0, 24)
+                oled.text("last %s %s" % (h2(last_id), last_status[:7]), 0, 34)
+                oled.text("sd %s" % sd.name, 0, 44)
+                oled.text("up %ds" % ((ext(time.ticks_us()) - t0) // 1_000_000), 0, 54)
                 oled.start_refresh()
             oled.step()
 
