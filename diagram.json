@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "author": "Tiempo Software",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "type": "wokwi-pi-pico",
+      "id": "pico",
+      "top": 0,
+      "left": 0,
+      "attrs": {
+        "env": "micropython-20260406-v1.28.0"
+      }
+    },
+    {
+      "type": "board-ssd1306",
+      "id": "oled1",
+      "top": -253.24,
+      "left": -189.65,
+      "attrs": {
+        "i2cAddress": "0x3c"
+      }
+    },
+    {
+      "type": "wokwi-microsd-card",
+      "id": "sd1",
+      "top": 125,
+      "left": -200,
+      "rotate": 90,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btnReset",
+      "top": 140,
+      "left": 140,
+      "attrs": {
+        "color": "blue",
+        "label": "New log"
+      }
+    }
+  ],
+  "connections": [
+    ["pico:GP4", "pico:GP5", "green", []],
+    ["oled1:GND", "pico:GND.1", "black", []],
+    ["oled1:VCC", "pico:3V3", "red", []],
+    ["oled1:SDA", "pico:GP8", "blue", []],
+    ["oled1:SCL", "pico:GP9", "purple", []],
+    ["sd1:SCK", "pico:GP10", "orange", []],
+    ["sd1:DI", "pico:GP11", "yellow", []],
+    ["sd1:DO", "pico:GP12", "cyan", []],
+    ["sd1:CS", "pico:GP13", "magenta", []],
+    ["sd1:VCC", "pico:3V3", "red", []],
+    ["sd1:GND", "pico:GND.4", "black", []],
+    ["btnReset:1.l", "pico:GP15", "blue", []],
+    ["btnReset:2.l", "pico:GND.5", "black", []]
+  ],
+  "dependencies": {}
+}
